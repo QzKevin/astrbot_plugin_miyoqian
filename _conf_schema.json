@@ -2,7 +2,7 @@
   "sign_time": {
     "description": "每日自动签到时间（24小时制，格式 HH:MM，北京时间）",
     "type": "string",
-    "default": "00:10"
+    "default": "10:00"
   },
   "push_result": {
     "description": "自动签到完成后是否向绑定者推送结果",
