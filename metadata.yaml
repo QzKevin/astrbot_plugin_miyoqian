@@ -2,7 +2,7 @@ name: astrbot_plugin_miyoqian # 插件唯一识别名，以 astrbot_plugin_ 前�
 display_name: 米游社签到 # 用于展示的名字
 desc: 米游社游戏每日签到（原神/星穹铁道/崩坏3/绝区零/崩坏2/未定事件簿）。支持 Cookie 绑定与扫码登录、多账号、多角色签到、每日自动签到、签到状态查询；原神/绝区零采用新版签到 API（x-rpc-signgame + act.mihoyo.com）。
 help: 发送「米游社 帮助」查看使用说明
-version: v1.0.0 # 插件版本号
+version: v1.0.2 # 插件版本号
 author: Kayin # 作者
 repo: https://github.com/QzKevin/astrbot_plugin_miyoqian # 插件的仓库地址
 short_desc: 米游社游戏每日自动签到（扫码/Cookie 绑定）

@@ -146,6 +146,32 @@ def _as_role_list(role_data):
     return []
 
 
+def _is_today_signed(info: dict) -> bool:
+    """判断今日是否已签到，优先使用接口明确返回的 is_sign。"""
+    if not isinstance(info, dict):
+        return False
+    is_sign = info.get("is_sign")
+    if isinstance(is_sign, bool):
+        return is_sign
+    if isinstance(is_sign, (int, float)):
+        return bool(is_sign)
+    if isinstance(is_sign, str):
+        normalized = is_sign.strip().lower()
+        if normalized in ("true", "1", "yes"):
+            return True
+        if normalized in ("false", "0", "no"):
+            return False
+
+    # 兼容旧响应字段：只有在接口没有返回 is_sign 时才用它兜底。
+    missing = info.get("sign_cnt_missing")
+    if missing is None:
+        return False
+    try:
+        return int(missing) == 0
+    except (TypeError, ValueError):
+        return False
+
+
 # ============================================================
 # 数据存储
 # ============================================================
@@ -487,8 +513,11 @@ class MihoyoSigninPlugin(Star):
                 continue
 
             info = j.get("data") or {}
+            if info.get("first_bind"):
+                lines.append(f"⚠️ {label} 首次绑定，请先在米游社手动签到一次")
+                continue
             total_sign_day = int(info.get("total_sign_day") or 0)
-            already = (int(info.get("sign_cnt_missing") or 0) == 0) or info.get("is_sign") is True
+            already = _is_today_signed(info)
             if already:
                 lines.append(f"✅ {label} 今日已签到（本月累计 {total_sign_day} 天）")
                 continue
@@ -505,7 +534,11 @@ class MihoyoSigninPlugin(Star):
 
             rc2 = j2.get("retcode")
             if rc2 == 0:
-                award = (j2.get("data") or {}).get("award")
+                sign_data = j2.get("data") or {}
+                if str(sign_data.get("success") or "") == "1":
+                    lines.append(f"⚠️ {label} 触发验证码/风控，本次未完成签到，请稍后在米游社手动签到")
+                    continue
+                award = sign_data.get("award")
                 if award:
                     name, cnt = award.get("name", "?"), award.get("cnt", 1)
                     lines.append(
@@ -982,7 +1015,10 @@ class MihoyoSigninPlugin(Star):
                     if j.get("retcode") == 0:
                         info = j.get("data") or {}
                         total = info.get("total_sign_day") or 0
-                        is_sign = (int(info.get("sign_cnt_missing") or 0) == 0) or info.get("is_sign") is True
+                        if info.get("first_bind"):
+                            lines.append(f"· {g['name']}（{rname} · {game_uid}）：首次绑定，请先在米游社手动签到一次")
+                            continue
+                        is_sign = _is_today_signed(info)
                         lines.append(
                             f"· {g['name']}（{rname} · {game_uid}）："
                             f"本月已签 {total} 天，今日{'已签 ✅' if is_sign else '未签 ❌'}")
