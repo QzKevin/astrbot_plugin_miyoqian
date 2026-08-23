@@ -33,7 +33,7 @@ import random
 import string
 import time
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -95,6 +95,9 @@ RETCODE_ALREADY_SIGNED = -5003   # 已签到
 RETCODE_CAPTCHA = 1034           # 触发验证码
 # 登录失效 / 凭证无效
 LOGIN_INVALID_CODES = (-100, -101, 10001, 1008, 10103, 10104)
+BJT = timezone(timedelta(hours=8))
+SCHEDULER_POLL_SECONDS = 30
+SCHEDULER_DUE_GRACE_SECONDS = 90
 
 
 # ============================================================
@@ -751,25 +754,56 @@ class MihoyoSigninPlugin(Star):
     # --------------------------------------------------------
 
     async def _scheduler_loop(self):
-        """定时任务主循环：每天配置时间执行全员自动签到"""
+        """定时任务主循环：每天配置时间执行全员自动签到。
+
+        AstrBot WebUI 修改配置时不会打断已经开始的长时间 sleep，所以这里短轮询
+        并重新读取 sign_time，确保改时间后无需重载插件也能及时生效。
+        """
+        last_run_key = ""
+        last_logged_next = ""
         while True:
             try:
-                now = datetime.now()
-                hm = str(self.config.get("sign_time", "00:10"))
-                try:
-                    hh, mm = hm.split(":")
-                    target = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
-                except Exception:
-                    target = now.replace(hour=0, minute=10, second=0, microsecond=0)
-                if target <= now:
+                now = datetime.now(BJT)
+                hh, mm, hm = self._normalized_sign_time()
+                target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                run_key = f"{now.date().isoformat()} {hm}"
+
+                if now >= target:
+                    if (
+                        last_run_key != run_key
+                        and (now - target).total_seconds() <= SCHEDULER_DUE_GRACE_SECONDS
+                    ):
+                        last_run_key = run_key
+                        logger.info(f"到达每日自动签到时间 {hm}，开始执行")
+                        await self._auto_sign_all()
+                        last_logged_next = ""
                     target += timedelta(days=1)
-                await asyncio.sleep(max(1, (target - now).total_seconds()))
-                await self._auto_sign_all()
+
+                next_text = target.strftime("%Y-%m-%d %H:%M:%S")
+                if next_text != last_logged_next:
+                    last_logged_next = next_text
+                    logger.info(f"米游社签到插件：下次每日自动签到时间 {next_text}（北京时间）")
+
+                wait_seconds = max(1, min(SCHEDULER_POLL_SECONDS, (target - now).total_seconds()))
+                await asyncio.sleep(wait_seconds)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"定时签到循环异常: {e}")
                 await asyncio.sleep(60)
+
+    def _normalized_sign_time(self) -> tuple[int, int, str]:
+        hm = str(self.config.get("sign_time", "00:10")).strip()
+        try:
+            hh, mm = hm.split(":", 1)
+            hour = int(hh)
+            minute = int(mm)
+            if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+                raise ValueError
+            return hour, minute, f"{hour:02d}:{minute:02d}"
+        except Exception:
+            logger.warning(f"sign_time 配置无效: {hm!r}，已使用默认 00:10")
+            return 0, 10, "00:10"
 
     def _enabled_games(self) -> list:
         cfg = self.config.get("games") or {}
@@ -779,7 +813,7 @@ class MihoyoSigninPlugin(Star):
 
     async def _auto_sign_all(self):
         """为所有绑定用户的全部账号执行每日自动签到"""
-        today = date.today().isoformat()
+        today = datetime.now(BJT).date().isoformat()
         enabled = self._enabled_games()
         async with self._sign_lock:
             for sender, user in list(self.store.data.items()):
