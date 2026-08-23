@@ -36,6 +36,9 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import httpx
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
@@ -96,8 +99,10 @@ RETCODE_CAPTCHA = 1034           # 触发验证码
 # 登录失效 / 凭证无效
 LOGIN_INVALID_CODES = (-100, -101, 10001, 1008, 10103, 10104)
 BJT = timezone(timedelta(hours=8))
-SCHEDULER_POLL_SECONDS = 30
-SCHEDULER_DUE_GRACE_SECONDS = 90
+AUTO_SIGN_JOB_ID = "miyoqian_auto_sign"
+SCHEDULE_REFRESH_JOB_ID = "miyoqian_schedule_refresh"
+SCHEDULE_REFRESH_SECONDS = 30
+SCHEDULER_MISFIRE_GRACE_SECONDS = 3600
 
 
 # ============================================================
@@ -233,7 +238,9 @@ class MihoyoSigninPlugin(Star):
         self.store = UserStore(os.path.join(self.data_dir, "users.json"))
         self._migrate_legacy_data()
         self._qr_tasks: dict = {}      # sender -> 扫码轮询任务
-        self._sched_task = None        # 定时签到任务
+        self.scheduler = AsyncIOScheduler(timezone=BJT)
+        self._scheduled_sign_time = ""
+        self._startup_due_checked_key = ""
         self._sign_lock = asyncio.Lock()
         self._device_id = self._load_device_id()
         self._apply_act_id_override()
@@ -753,44 +760,85 @@ class MihoyoSigninPlugin(Star):
     # 定时自动签到
     # --------------------------------------------------------
 
-    async def _scheduler_loop(self):
-        """定时任务主循环：每天配置时间执行全员自动签到。
+    def _configure_auto_sign_job(self, source: str):
+        """按当前配置注册每日自动签到 cron job。"""
+        hh, mm, hm = self._normalized_sign_time()
+        self.scheduler.add_job(
+            self._scheduled_auto_sign_all,
+            trigger=CronTrigger(hour=hh, minute=mm, timezone=BJT),
+            id=AUTO_SIGN_JOB_ID,
+            replace_existing=True,
+            misfire_grace_time=SCHEDULER_MISFIRE_GRACE_SECONDS,
+            coalesce=True,
+            max_instances=1,
+        )
+        self._scheduled_sign_time = hm
+        logger.info(
+            f"米游社签到插件：每日自动签到任务已配置，每天 {hm} 执行"
+            f"（北京时间，{source}）"
+        )
 
-        AstrBot WebUI 修改配置时不会打断已经开始的长时间 sleep，所以这里短轮询
-        并重新读取 sign_time，确保改时间后无需重载插件也能及时生效。
-        """
-        last_run_key = ""
-        last_logged_next = ""
-        while True:
-            try:
-                now = datetime.now(BJT)
-                hh, mm, hm = self._normalized_sign_time()
-                target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-                run_key = f"{now.date().isoformat()} {hm}"
+    def _configure_schedule_refresh_job(self):
+        """定期同步 WebUI 中可能变更的 sign_time。"""
+        self.scheduler.add_job(
+            self._refresh_schedule_if_needed,
+            trigger=IntervalTrigger(seconds=SCHEDULE_REFRESH_SECONDS, timezone=BJT),
+            id=SCHEDULE_REFRESH_JOB_ID,
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
 
-                if now >= target:
-                    if (
-                        last_run_key != run_key
-                        and (now - target).total_seconds() <= SCHEDULER_DUE_GRACE_SECONDS
-                    ):
-                        last_run_key = run_key
-                        logger.info(f"到达每日自动签到时间 {hm}，开始执行")
-                        await self._auto_sign_all()
-                        last_logged_next = ""
-                    target += timedelta(days=1)
+    def _ensure_scheduler_started(self, source: str):
+        if self.scheduler.running:
+            return
+        self.scheduler.start()
+        logger.info(f"米游社签到插件：APScheduler 已启动（{source}）")
 
-                next_text = target.strftime("%Y-%m-%d %H:%M:%S")
-                if next_text != last_logged_next:
-                    last_logged_next = next_text
-                    logger.info(f"米游社签到插件：下次每日自动签到时间 {next_text}（北京时间）")
+    async def _activate_scheduler(self, source: str):
+        """初始化或刷新 APScheduler 任务。"""
+        self._configure_auto_sign_job(source)
+        self._configure_schedule_refresh_job()
+        self._ensure_scheduler_started(source)
+        await self._run_missed_today_if_needed(source)
 
-                wait_seconds = max(1, min(SCHEDULER_POLL_SECONDS, (target - now).total_seconds()))
-                await asyncio.sleep(wait_seconds)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"定时签到循环异常: {e}")
-                await asyncio.sleep(60)
+    async def _refresh_schedule_if_needed(self):
+        """配置面板修改时间后，自动重建签到任务。"""
+        try:
+            _, _, hm = self._normalized_sign_time()
+            if hm == self._scheduled_sign_time and self.scheduler.get_job(AUTO_SIGN_JOB_ID):
+                return
+            old_hm = self._scheduled_sign_time or "未配置"
+            self._configure_auto_sign_job("配置变更")
+            logger.info(f"每日自动签到时间已从 {old_hm} 更新为 {hm}（北京时间）")
+            await self._run_missed_today_if_needed("配置变更")
+        except Exception as e:
+            logger.error(f"同步每日自动签到配置失败: {e}")
+
+    async def _scheduled_auto_sign_all(self):
+        _, _, hm = self._normalized_sign_time()
+        logger.info(f"到达每日自动签到时间 {hm}，开始执行")
+        await self._auto_sign_all()
+
+    async def _run_missed_today_if_needed(self, source: str):
+        """启动或改配置时，如果今天的时间已经过了且尚未执行，则补跑一次。"""
+        hh, mm, hm = self._normalized_sign_time()
+        now = datetime.now(BJT)
+        target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if now < target:
+            return
+
+        run_key = f"{now.date().isoformat()} {hm}"
+        if self._startup_due_checked_key == run_key:
+            return
+
+        self._startup_due_checked_key = run_key
+        delay = int((now - target).total_seconds())
+        logger.info(
+            f"每日自动签到时间 {hm} 已过 {delay} 秒，"
+            f"启动/配置同步后检查今日是否需要补跑（{source}）"
+        )
+        await self._auto_sign_all()
 
     def _normalized_sign_time(self) -> tuple[int, int, str]:
         hm = str(self.config.get("sign_time", "00:10")).strip()
@@ -815,13 +863,31 @@ class MihoyoSigninPlugin(Star):
         """为所有绑定用户的全部账号执行每日自动签到"""
         today = datetime.now(BJT).date().isoformat()
         enabled = self._enabled_games()
+        if not enabled:
+            logger.warning("自动签到已跳过：配置中没有启用任何游戏")
+            return
+
+        stats = {
+            "users_total": 0,
+            "users_signed": 0,
+            "users_skipped_today": 0,
+            "users_no_accounts": 0,
+            "push_sent": 0,
+            "push_disabled": 0,
+            "push_missing_target": 0,
+        }
         async with self._sign_lock:
             for sender, user in list(self.store.data.items()):
+                stats["users_total"] += 1
                 try:
                     if user.get("last_auto_sign_date") == today:
+                        stats["users_skipped_today"] += 1
+                        logger.info(f"自动签到跳过 user={sender}: 今日已执行过")
                         continue
                     accounts = user.get("accounts") or []
                     if not accounts:
+                        stats["users_no_accounts"] += 1
+                        logger.info(f"自动签到跳过 user={sender}: 没有绑定账号")
                         continue
                     all_lines = []
                     for ai, acc in enumerate(accounts):
@@ -837,11 +903,26 @@ class MihoyoSigninPlugin(Star):
                             tag = f"📎 账号{ai + 1}（{acc.get('nickname', acc.get('bbs_uid', '?'))}）\n"
                         all_lines.append(tag + "\n".join(lines))
                     user["last_auto_sign_date"] = today
+                    stats["users_signed"] += 1
                     if self.config.get("push_result", True) and user.get("umo"):
                         await self._send(user["umo"], "🕐 每日自动签到结果\n" + "\n".join(all_lines))
+                        stats["push_sent"] += 1
+                    elif not self.config.get("push_result", True):
+                        stats["push_disabled"] += 1
+                        logger.info(f"自动签到结果未推送 user={sender}: push_result 已关闭")
+                    else:
+                        stats["push_missing_target"] += 1
+                        logger.warning(f"自动签到结果未推送 user={sender}: 缺少绑定会话 umo")
                 except Exception as e:
                     logger.error(f"自动签到失败 user={sender}: {e}")
             await self.store.save()
+        logger.info(
+            "自动签到完成："
+            f"用户 {stats['users_total']}，执行 {stats['users_signed']}，"
+            f"今日已跳过 {stats['users_skipped_today']}，无账号 {stats['users_no_accounts']}，"
+            f"已推送 {stats['push_sent']}，关闭推送 {stats['push_disabled']}，"
+            f"缺少推送目标 {stats['push_missing_target']}"
+        )
 
     # --------------------------------------------------------
     # 指令
@@ -1177,17 +1258,19 @@ class MihoyoSigninPlugin(Star):
     # 生命周期
     # --------------------------------------------------------
 
+    async def initialize(self):
+        """插件初始化后启动 APScheduler。"""
+        await self._activate_scheduler("插件初始化")
+
     @filter.on_astrbot_loaded()
     async def on_loaded(self):
-        """AstrBot 加载完成后启动定时任务"""
-        if self._sched_task is None or self._sched_task.done():
-            self._sched_task = asyncio.create_task(self._scheduler_loop())
-            logger.info("米游社签到插件：每日自动签到任务已启动")
+        """AstrBot 加载完成后兜底刷新定时任务。"""
+        await self._activate_scheduler("AstrBot 加载完成")
 
     async def terminate(self):
         """插件卸载 / 停用时清理任务"""
-        if self._sched_task:
-            self._sched_task.cancel()
+        if self.scheduler.running:
+            self.scheduler.shutdown(wait=False)
         for t in list(self._qr_tasks.values()):
             t.cancel()
         self._qr_tasks.clear()
